@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>BlockCraft Schach</title>
+<meta name="description" content="Schach im blockigen Voxel-Look. Einfache Regeln, kein Rochade/En passant. Matt & Patt-Erkennung.">
+<style>
+  :root{--bg:#0f1220;--fg:#eef1ff;--mut:#9aa3c7;--panel:#111936;--w:#9be6ff;--b:#ffb36b;--sel:#79ff9b;--move:#72d8ff88;--check:#ff6b6b88}
+  *{box-sizing:border-box} html,body{height:100%;margin:0;background:#0f1220;color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+  header,footer{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--panel)}
+  #wrap{height:calc(100% - 96px);display:flex;flex-direction:column}
+  .row{display:flex;gap:12px;align-items:center}
+  button{border:none;border-radius:12px;padding:10px 14px;font-weight:800;cursor:pointer;background:#79ff9b;color:#072113}
+  .ghost{background:transparent;color:var(--fg);border:1px solid #2a3568}
+  .chip{border:1px solid #2a3568;color:var(--mut);padding:6px 10px;border-radius:999px;font-size:12px;margin-left:8px}
+  #status{font-size:14px;color:var(--mut)}
+  canvas{flex:1;width:100%;height:100%;display:block;touch-action:none;background:linear-gradient(180deg,#0f1530,#0c1228)}
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <strong>♜ BlockCraft Schach</strong>
+    <span class="chip" id="turnChip">Zug: Weiß</span>
+    <span class="chip" id="status">Bereit</span>
+  </div>
+  <div class="row">
+    <button id="newBtn">Neu</button>
+    <button id="shareBtn" class="ghost">Teilen</button>
+  </div>
+</header>
+
+<div id="wrap">
+  <canvas id="game"></canvas>
+</div>
+
+<footer>
+  <div>Kein Rochade/En passant · Auto-Umwandlung: Dame</div>
+  <div>Hotseat · Voxel-Style</div>
+</footer>
+
+<script>
+(()=>{
+/* ===== Setup DOM/Canvas ===== */
+const cvs=document.getElementById('game'), ctx=cvs.getContext('2d');
+const newBtn=document.getElementById('newBtn'), shareBtn=document.getElementById('shareBtn');
+const turnChip=document.getElementById('turnChip'), statusEl=document.getElementById('status');
+
+function fit(){
+  const dpr=Math.max(1,Math.min(3,window.devicePixelRatio||1));
+  const r=cvs.getBoundingClientRect();
+  cvs.width=Math.floor(r.width*dpr); cvs.height=Math.floor(r.height*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize', fit, {passive:true}); fit();
+
+/* ===== Board / Pieces ===== */
+const START = [
+  ['bR','bN','bB','bQ','bK','bB','bN','bR'],
+  ['bP','bP','bP','bP','bP','bP','bP','bP'],
+  ['','','','','','','',''],
+  ['','','','','','','',''],
+  ['','','','','','','',''],
+  ['','','','','','','',''],
+  ['wP','wP','wP','wP','wP','wP','wP','wP'],
+  ['wR','wN','wB','wQ','wK','wB','wN','wR'],
+];
+
+let board, turn, selected=null, legalMoves=[];
+reset();
+
+/* ===== Helpers ===== */
+function reset(){
+  board=START.map(r=>r.slice());
+  turn='w';
+  selected=null; legalMoves=[];
+  setStatus('Bereit'); setTurnChip();
+  draw();
+}
+function setTurnChip(){
+  turnChip.textContent='Zug: '+(turn==='w'?'Weiß':'Schwarz');
+}
+function setStatus(msg){ statusEl.textContent=msg; }
+function inBounds(r,c){ return r>=0&&r<8&&c>=0&&c<8; }
+function cloneBoard(b){ return b.map(r=>r.slice()); }
+
+function findKing(b,color){
+  for(let r=0;r<8;r++)for(let c=0;c<8;c++){
+    if(b[r][c]===color+'K') return [r,c];
+  }
+  return null;
+}
+
+/* ===== Attacks / Rules ===== */
+const DIRS = {
+  N:[[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]],
+  B:[[1,1],[1,-1],[-1,1],[-1,-1]],
+  R:[[1,0],[-1,0],[0,1],[0,-1]],
+};
+function isSquareAttacked(b, r, c, byColor){
+  // Knights
+  for(const [dr,dc] of DIRS.N){
+    const rr=r+dr, cc=c+dc; if(!inBounds(rr,cc)) continue;
+    if(b[rr][cc]===byColor+'N') return true;
+  }
+  // Bishops/Queens (diagonals)
+  for(const [dr,dc] of DIRS.B){
+    let rr=r+dr, cc=c+dc;
+    while(inBounds(rr,cc)){
+      const p=b[rr][cc];
+      if(p){ if(p[0]===byColor&&(p[1]==='B'||p[1]==='Q')) return true; break; }
+      rr+=dr; cc+=dc;
+    }
+  }
+  // Rooks/Queens (orthogonal)
+  for(const [dr,dc] of DIRS.R){
+    let rr=r+dr, cc=c+dc;
+    while(inBounds(rr,cc)){
+      const p=b[rr][cc];
+      if(p){ if(p[0]===byColor&&(p[1]==='R'||p[1]==='Q')) return true; break; }
+      rr+=dr; cc+=dc;
+    }
+  }
+  // Pawns
+  const dir = byColor==='w' ? -1 : 1;
+  for(const dc of [-1,1]){
+    const rr=r+dir, cc=c+dc;
+    if(inBounds(rr,cc) && b[rr][cc]===byColor+'P') return true;
+  }
+  // King
+  for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){
+    if(dr===0&&dc===0) continue;
+    const rr=r+dr, cc=c+dc; if(!inBounds(rr,cc)) continue;
+    if(b[rr][cc]===byColor+'K') return true;
+  }
+  return false;
+}
+
+function generateMoves(b, color){
+  const moves=[];
+  for(let r=0;r<8;r++)for(let c=0;c<8;c++){
+    const p=b[r][c]; if(!p||p[0]!==color) continue;
+    const type=p[1];
+    if(type==='P'){
+      const dir=color==='w'?-1:1, startRow=color==='w'?6:1, promoRow=color==='w'?0:7;
+      // 1 forward
+      if(inBounds(r+dir,c) && !b[r+dir][c]) moves.push([r,c,r+dir,c]);
+      // 2 forward
+      if(r===startRow && !b[r+dir][c] && !b[r+2*dir][c]) moves.push([r,c,r+2*dir,c]);
+      // captures
+      for(const dc of [-1,1]){
+        const rr=r+dir, cc=c+dc;
+        if(inBounds(rr,cc) && b[rr][cc] && b[rr][cc][0]!==color) moves.push([r,c,rr,cc]);
+      }
+      // Promotions handled on apply
+    } else if(type==='N'){
+      for(const [dr,dc] of DIRS.N){
+        const rr=r+dr,cc=c+dc; if(!inBounds(rr,cc)) continue;
+        if(!b[rr][cc] || b[rr][cc][0]!==color) moves.push([r,c,rr,cc]);
+      }
+    } else if(type==='B'||type==='R'||type==='Q'){
+      const dirs = type==='B'?DIRS.B : type==='R'?DIRS.R : [...DIRS.B,...DIRS.R];
+      for(const [dr,dc] of dirs){
+        let rr=r+dr,cc=c+dc;
+        while(inBounds(rr,cc)){
+          if(!b[rr][cc]) moves.push([r,c,rr,cc]);
+          else { if(b[rr][cc][0]!==color) moves.push([r,c,rr,cc]); break; }
+          rr+=dr; cc+=dc;
+        }
+      }
+    } else if(type==='K'){
+      for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){
+        if(dr===0&&dc===0) continue;
+        const rr=r+dr,cc=c+dc; if(!inBounds(rr,cc)) continue;
+        if(!b[rr][cc] || b[rr][cc][0]!==color) moves.push([r,c,rr,cc]);
+      }
+    }
+  }
+  // Filter: cannot leave your king in check
+  const legal=[];
+  for(const m of moves){
+    const nb=cloneBoard(b);
+    const [r1,c1,r2,c2]=m;
+    let piece=nb[r1][c1];
+    // apply
+    nb[r1][c1]='';
+    // promotion to Queen if pawn reaches last rank
+    if(piece[1]==='P' && (r2===0||r2===7)) piece=piece[0]+'Q';
+    nb[r2][c2]=piece;
+    const k=findKing(nb,color);
+    if(k && !isSquareAttacked(nb,k[0],k[1], color==='w'?'b':'w')) legal.push(m);
+  }
+  return legal;
+}
+
+/* ===== Game flow ===== */
+function allLegalMoves(color){ return generateMoves(board,color); }
+
+function applyMove(m){
+  const [r1,c1,r2,c2]=m;
+  let p=board[r1][c1];
+  board[r1][c1]='';
+  if(p[1]==='P' && (r2===0||r2===7)) p=p[0]+'Q';
+  board[r2][c2]=p;
+}
+
+function squareFromPoint(x,y){
+  const size=Math.min(cvs.clientWidth, cvs.clientHeight)*0.9;
+  const offX=(cvs.clientWidth-size)/2, offY=(cvs.clientHeight-size)/2;
+  const sq=size/8;
+  const c=Math.floor((x-offX)/sq), r=Math.floor((y-offY)/sq);
+  if(r<0||r>7||c<0||c>7) return null;
+  return {r,c,offX,offY,sq};
+}
+
+/* ===== Rendering ===== */
+function noiseRect(x,y,w,h,base){
+  // simple blocky texture
+  ctx.fillStyle=base; ctx.fillRect(x,y,w,h);
+  const n=20;
+  for(let i=0;i<n;i++){
+    ctx.fillStyle='rgba(0,0,0,0.05)';
+    const rx=x+Math.random()*w, ry=y+Math.random()*h;
+    ctx.fillRect(rx,ry, Math.random()*4, Math.random()*4);
+  }
+}
+function draw(){
+  const W=cvs.clientWidth, H=cvs.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  const size=Math.min(W,H)*0.9;
+  const offX=(W-size)/2, offY=(H-size)/2, sq=size/8;
+
+  // Board tiles
+  for(let r=0;r<8;r++)for(let c=0;c<8;c++){
+    const x=offX+c*sq, y=offY+r*sq;
+    const dark=((r+c)%2)===1;
+    noiseRect(x,y,sq,sq, dark?'#1a2144':'#16203e');
+  }
+
+  // Highlights
+  if(selected){
+    // selected square
+    ctx.fillStyle='rgba(121,255,155,0.25)';
+    ctx.fillRect(offX+selected.c*sq, offY+selected.r*sq, sq, sq);
+    // legal moves
+    ctx.fillStyle='var(--move)';
+    for(const m of legalMoves){
+      const [r1,c1,r2,c2]=m;
+      if(r1===selected.r && c1===selected.c){
+        ctx.fillRect(offX+c2*sq, offY+r2*sq, sq, sq);
+      }
+    }
+  }
+
+  // Check indicator
+  const k=findKing(board, turn);
+  if(k && isSquareAttacked(board,k[0],k[1], turn==='w'?'b':'w')){
+    ctx.fillStyle='var(--check)';
+    ctx.fillRect(offX+k[1]*sq, offY+k[0]*sq, sq, sq);
+  }
+
+  // Pieces (blocky)
+  for(let r=0;r<8;r++)for(let c=0;c<8;c++){
+    const p=board[r][c]; if(!p) continue;
+    const x=offX+c*sq, y=offY+r*sq;
+    // block base
+    ctx.fillStyle = p[0]==='w' ? '#2a3b6d' : '#533622';
+    ctx.fillRect(x+sq*0.15,y+sq*0.15,sq*0.7,sq*0.7);
+    ctx.fillStyle='rgba(255,255,255,0.06)';
+    ctx.fillRect(x+sq*0.15,y+sq*0.15,sq*0.7,sq*0.2);
+
+    // letter
+    const letter = ({P:'P',N:'N',B:'B',R:'R',Q:'Q',K:'K'})[p[1]];
+    ctx.fillStyle = p[0]==='w' ? 'var(--w)' : 'var(--b)';
+    ctx.font = Math.floor(sq*0.5)+'px system-ui';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(letter, x+sq/2, y+sq/2+1);
+  }
+
+  // border
+  ctx.strokeStyle='#2a3568'; ctx.lineWidth=2;
+  ctx.strokeRect(offX,offY,size,size);
+}
+
+/* ===== Input ===== */
+cvs.addEventListener('pointerdown', (e)=>{
+  const r=cvs.getBoundingClientRect();
+  const pt=squareFromPoint(e.clientX-r.left, e.clientY-r.top);
+  if(!pt) return;
+  const {r:sr, c:sc} = pt;
+  const on = board[sr][sc];
+
+  // If there is a selected piece and clicked a legal destination
+  if(selected){
+    const dest = legalMoves.find(m=>m[0]===selected.r && m[1]===selected.c && m[2]===sr && m[3]===sc);
+    if(dest){
+      applyMove(dest);
+      // Turn switch & end-state check
+      turn = (turn==='w')?'b':'w';
+      setTurnChip();
+
+      const moves = allLegalMoves(turn);
+      const k=findKing(board,turn);
+      const inCheck = k && isSquareAttacked(board,k[0],k[1], turn==='w'?'b':'w');
+      if(moves.length===0){
+        if(inCheck){ setStatus('Schachmatt! '+(turn==='w'?'Schwarz':'Weiß')+' gewinnt'); }
+        else { setStatus('Patt – Unentschieden'); }
+      } else {
+        setStatus(inCheck?'Achtung: Schach!':'Zug bereit');
+      }
+
+      selected=null; legalMoves=[];
+      draw();
+      return;
+    }
+  }
+
+  // (Re)select
+  if(on && on[0]===turn){
+    selected = {r:sr,c:sc};
+    legalMoves = generateMoves(board, turn).filter(m=>m[0]===sr && m[1]===sc);
+    draw();
+  } else {
+    selected=null; legalMoves=[]; draw();
+  }
+}, {passive:true});
+
+/* ===== Buttons ===== */
+newBtn.addEventListener('click', ()=>{ reset(); });
+shareBtn.addEventListener('click', async ()=>{
+  const url=location.href, text='Spiel BlockCraft Schach mit mir!';
+  if(navigator.share){ try{ await navigator.share({title:'BlockCraft Schach',text,url}); }catch{} }
+  else{
+    try{ await navigator.clipboard.writeText(url); shareBtn.textContent='Link kopiert ✓'; setTimeout(()=>shareBtn.textContent='Teilen',1200); }
+    catch{ alert(url); }
+  }
+});
+
+/* ===== Kickoff ===== */
+draw();
+setStatus('Bereit – Weiß beginnt');
+})();
+</script>
+</body>
+</html>
